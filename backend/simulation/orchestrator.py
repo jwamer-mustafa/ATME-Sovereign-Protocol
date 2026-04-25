@@ -1,0 +1,285 @@
+"""
+Simulation Orchestrator: Ties together physics, perception, learning, memory,
+and event injection into a coherent simulation loop.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from typing import Any
+
+import numpy as np
+import torch
+
+from backend.ethics.safeguards import format_ethical_response
+from backend.learning.ppo import PPOConfig, PPOTrainer
+from backend.memory.episodic import EpisodicMemory, ReplayBuffer
+from backend.perception.encoder import PerceptionPipeline
+from backend.simulation.event_injector import EventInjector, ResponseGenerator
+from backend.simulation.physics_env import EnvConfig, PhysicsEnvironment
+from backend.streaming.ws_manager import (
+    ConnectionManager,
+    prepare_perception_payload,
+)
+
+
+class SimulationOrchestrator:
+    """Main orchestrator that runs the simulation loop."""
+
+    def __init__(self, env_config: EnvConfig | None = None,
+                 ppo_config: PPOConfig | None = None,
+                 device: str = "cpu"):
+        self.env = PhysicsEnvironment(config=env_config)
+        self.perception = PerceptionPipeline(device=device)
+        self.trainer = PPOTrainer(config=ppo_config, device=device)
+        self.memory = EpisodicMemory(capacity=10000)
+        self.replay_buffer = ReplayBuffer()
+        self.event_injector = EventInjector()
+        self.response_generator = ResponseGenerator()
+        self.ws_manager = ConnectionManager()
+
+        self.device = device
+        self.running = False
+        self.paused = False
+        self.speed_multiplier = 1.0
+        self.step_count = 0
+        self.episode_count = 0
+        self.current_latent: np.ndarray | None = None
+        self.current_action_info: dict[str, Any] = {}
+        self._training_enabled = True
+
+    def reset(self) -> np.ndarray:
+        """Reset the environment and return initial observation."""
+        frame = self.env.reset()
+        self.step_count = 0
+        self.episode_count += 1
+        return frame
+
+    def step(self, frame: np.ndarray) -> dict[str, Any]:
+        """Run one simulation step: perceive → decide → act → learn."""
+        frame_tensor = (
+            torch.FloatTensor(frame).permute(2, 0, 1).unsqueeze(0) / 255.0
+        )
+
+        perception = self.perception.process_frame(frame_tensor)
+        latent_z = perception["latent"].cpu().numpy().squeeze(0)
+        self.current_latent = latent_z
+
+        action_info = self.trainer.select_action(latent_z)
+        self.current_action_info = action_info
+        action = action_info["action"]
+
+        result = self.env.step(action)
+
+        if self._training_enabled:
+            self.trainer.store_transition(
+                state=latent_z,
+                action=action,
+                reward=result.reward,
+                value=action_info["value"],
+                log_prob=action_info["log_prob"],
+                done=result.done,
+            )
+
+            next_frame_tensor = (
+                torch.FloatTensor(result.observation).permute(2, 0, 1).unsqueeze(0) / 255.0
+            )
+            with torch.no_grad():
+                next_perception = self.perception.process_frame(next_frame_tensor)
+            next_z = next_perception["latent"].cpu().numpy().squeeze(0)
+            self.replay_buffer.add(latent_z, action, result.reward, next_z, result.done)
+
+        self._check_event_interactions()
+        self.step_count += 1
+
+        attention_np = perception["attention_map"].cpu().numpy()
+        features_np = perception["features_downsampled"].cpu().numpy().squeeze(0)
+
+        return {
+            "frame": result.observation,
+            "attention_map": attention_np,
+            "features": features_np,
+            "action_info": action_info,
+            "reward": result.reward,
+            "done": result.done,
+            "state": result.info,
+            "step": self.step_count,
+        }
+
+    def train_step(self) -> dict[str, Any] | None:
+        """Run PPO update if buffer is full."""
+        if not self.trainer.buffer.full:
+            return None
+
+        if self.current_latent is not None:
+            z_tensor = torch.FloatTensor(self.current_latent).unsqueeze(0)
+            with torch.no_grad():
+                _, value = self.trainer.policy(z_tensor.to(self.trainer.device))
+            last_value = value.item()
+        else:
+            last_value = 0.0
+
+        stats = self.trainer.update(last_value)
+        return stats
+
+    def inject_question(self, text: str, user_id: str = "anon") -> dict[str, Any]:
+        """Inject a question as a world event."""
+        event = self.event_injector.create_question_event(text)
+
+        body_id = self.env.inject_entity(
+            "query_orb",
+            metadata={"event_id": event.event_id, "text": text},
+        )
+        event.body_id = body_id
+        event.position = list(
+            self.env.agent.position + np.array([
+                np.cos(self.env.agent.orientation) * 2,
+                np.sin(self.env.agent.orientation) * 2,
+                0,
+            ])
+        )
+
+        if self.current_latent is not None:
+            self.memory.store(
+                embedding=self.current_latent,
+                event_type="question",
+                context=text,
+                metadata={"user_id": user_id, "event_id": event.event_id},
+            )
+
+        return {
+            "event_id": event.event_id,
+            "body_id": body_id,
+            "position": event.position,
+            "status": "injected",
+        }
+
+    def process_question_response(self, event_id: str) -> dict[str, Any] | None:
+        """Generate a response for a question event."""
+        event = self.event_injector.active_events.get(event_id)
+        if not event:
+            return None
+
+        if self.current_latent is not None:
+            memories = self.memory.retrieve(self.current_latent, top_k=5)
+        else:
+            memories = []
+
+        confidence = min(0.95, len(memories) * 0.15) if memories else 0.0
+
+        raw_response = self.response_generator.generate(
+            question=event.text,
+            context_memories=memories,
+            agent_state=self.env.get_state(),
+            confidence=confidence,
+        )
+
+        ethical_response = format_ethical_response(
+            answer=raw_response["text"],
+            confidence=confidence,
+            uncertainty_factors=["limited sensory context", "finite memory window"],
+        )
+
+        self.event_injector.resolve_event(event_id, ethical_response["text"], confidence)
+
+        if self.current_latent is not None:
+            self.memory.store(
+                embedding=self.current_latent,
+                event_type="response",
+                context=event.text,
+                response=ethical_response["text"],
+                metadata={"confidence": confidence},
+            )
+
+        return ethical_response
+
+    def get_full_state(self) -> dict[str, Any]:
+        """Get complete simulation state for streaming."""
+        env_state = self.env.get_state()
+        return {
+            "environment": env_state,
+            "training": {
+                "total_steps": self.trainer.total_steps,
+                "episode": self.episode_count,
+                "stats": self.trainer.training_stats[-1]
+                if self.trainer.training_stats else {},
+            },
+            "memory": {
+                "episodic_size": self.memory.size,
+                "replay_size": self.replay_buffer.size,
+            },
+            "events": {
+                "active": len(self.event_injector.get_active_events()),
+                "resolved": len(self.event_injector.get_resolved_events()),
+            },
+            "action": self.current_action_info,
+            "speed": self.speed_multiplier,
+            "paused": self.paused,
+        }
+
+    async def run_loop(self, target_fps: int = 60,
+                       perception_fps: int = 15) -> None:
+        """Main async simulation loop."""
+        self.running = True
+        frame = self.reset()
+        state_interval = 1.0 / target_fps
+        perception_interval = 1.0 / perception_fps
+        last_perception_time = 0.0
+
+        while self.running:
+            if self.paused:
+                await asyncio.sleep(0.1)
+                continue
+
+            start = time.time()
+            step_result = self.step(frame)
+            frame = step_result["frame"]
+
+            state = self.get_full_state()
+            await self.ws_manager.broadcast_state(state)
+
+            now = time.time()
+            if now - last_perception_time >= perception_interval:
+                perception_payload = prepare_perception_payload(
+                    frame=step_result["frame"],
+                    attention_map=step_result["attention_map"],
+                    action_info=step_result["action_info"],
+                    features=step_result["features"],
+                )
+                await self.ws_manager.broadcast_perception(perception_payload)
+                last_perception_time = now
+
+            train_stats = self.train_step()
+            if train_stats:
+                await self.ws_manager.broadcast_state({
+                    "type": "training_update",
+                    "data": train_stats,
+                })
+
+            if step_result["done"]:
+                frame = self.reset()
+
+            elapsed = time.time() - start
+            sleep_time = max(0, state_interval / self.speed_multiplier - elapsed)
+            await asyncio.sleep(sleep_time)
+
+    def stop(self) -> None:
+        self.running = False
+
+    def set_speed(self, multiplier: float) -> None:
+        self.speed_multiplier = max(0.1, min(100.0, multiplier))
+
+    def toggle_pause(self) -> bool:
+        self.paused = not self.paused
+        return self.paused
+
+    def _check_event_interactions(self) -> None:
+        """Check if agent is near any active events and trigger responses."""
+        for event in self.event_injector.get_active_events():
+            if event.body_id < 0:
+                continue
+            event_pos = np.array(event.position)
+            dist = np.linalg.norm(self.env.agent.position[:2] - event_pos[:2])
+            if dist < 1.5:
+                self.process_question_response(event.event_id)
