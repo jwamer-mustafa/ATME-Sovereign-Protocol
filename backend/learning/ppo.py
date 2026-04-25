@@ -199,7 +199,7 @@ class PPOTrainer:
         confidence = max(0.0, min(1.0, confidence))
 
         return {
-            "action": action_np,
+            "action": action_np.tolist(),
             "log_prob": log_prob.item(),
             "value": value.item(),
             "entropy": entropy.item(),
