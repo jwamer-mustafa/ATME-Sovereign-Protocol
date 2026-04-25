@@ -94,6 +94,10 @@ class EnvParamRequest(BaseModel):
     value: float
 
 
+class AgentSelectRequest(BaseModel):
+    agent_id: str
+
+
 # --- Dependencies ---
 
 async def get_current_user(
@@ -333,6 +337,83 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
 
     except WebSocketDisconnect:
         await orchestrator.ws_manager.disconnect(client_id)
+
+
+# --- Multilingual endpoints ---
+
+@app.get("/api/languages")
+async def get_languages():
+    """Get supported languages."""
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Simulation not running")
+    return {"languages": orchestrator.multilingual.get_supported_languages()}
+
+
+@app.post("/api/detect-language")
+async def detect_language(req: EventRequest):
+    """Detect the language of input text."""
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Simulation not running")
+    result = orchestrator.multilingual.process_input(req.text)
+    return result
+
+
+# --- Retention endpoints ---
+
+@app.get("/api/retention/state")
+async def get_retention_state(user: User = Depends(require_user)):
+    """Get user retention state (badges, evolution, selected agent)."""
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Simulation not running")
+    store = orchestrator.retention.get_store(user.user_id)
+    return store.get_state()
+
+
+@app.post("/api/retention/select-agent")
+async def select_agent(req: AgentSelectRequest, user: User = Depends(require_user)):
+    """Select a specific agent profile."""
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Simulation not running")
+    store = orchestrator.retention.get_store(user.user_id)
+    profile = store.select_agent(req.agent_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Agent profile not found")
+    return {
+        "selected": profile.agent_id,
+        "name": profile.name,
+        "style": profile.behavior_style,
+        "traits": profile.traits,
+    }
+
+
+@app.get("/api/retention/challenge")
+async def get_challenge(user: User = Depends(require_user)):
+    """Generate a personalized challenge for the user."""
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Simulation not running")
+    store = orchestrator.retention.get_store(user.user_id)
+    difficulty = orchestrator.ecology.curriculum.difficulty
+    challenge = store.generate_challenge(difficulty)
+    return challenge
+
+
+@app.get("/api/retention/evolution")
+async def get_evolution(user: User = Depends(require_user)):
+    """Get evolution comparison (current vs previous performance)."""
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Simulation not running")
+    store = orchestrator.retention.get_store(user.user_id)
+    return store.get_evolution_comparison()
+
+
+# --- Ecology endpoints ---
+
+@app.get("/api/ecology/state")
+async def get_ecology_state():
+    """Get current ecology state (resources, NPCs, weather, day/night)."""
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Simulation not running")
+    return orchestrator.ecology.get_state()
 
 
 # --- Health check ---

@@ -1,6 +1,7 @@
 """
 Simulation Orchestrator: Ties together physics, perception, learning, memory,
-and event injection into a coherent simulation loop.
+event injection, procedural generation, ecology, multilingual, and retention
+into a coherent simulation loop.
 """
 
 from __future__ import annotations
@@ -15,9 +16,21 @@ import torch
 from backend.ethics.safeguards import format_ethical_response
 from backend.learning.ppo import PPOConfig, PPOTrainer
 from backend.memory.episodic import EpisodicMemory, ReplayBuffer
+from backend.multilingual.translator import MultilingualPipeline
 from backend.perception.encoder import PerceptionPipeline
-from backend.simulation.event_injector import EventInjector, ResponseGenerator
-from backend.simulation.physics_env import EnvConfig, PhysicsEnvironment
+from backend.retention.user_memory import RetentionManager
+from backend.simulation.ecology import EcologyManager
+from backend.simulation.event_injector import (
+    EventInjector,
+    ResponseGenerator,
+    get_orb_animation_state,
+)
+from backend.simulation.physics_env import EnvConfig, PhysicsEnvironment, StepResult
+from backend.simulation.procedural import (
+    ProceduralConfig,
+    WorldSeed,
+    generate_world,
+)
 from backend.streaming.ws_manager import (
     ConnectionManager,
     prepare_perception_payload,
@@ -29,7 +42,9 @@ class SimulationOrchestrator:
 
     def __init__(self, env_config: EnvConfig | None = None,
                  ppo_config: PPOConfig | None = None,
-                 device: str = "cpu"):
+                 device: str = "cpu",
+                 user_id: str = "anon",
+                 session_id: str = "default"):
         self.env = PhysicsEnvironment(config=env_config)
         self.perception = PerceptionPipeline(device=device)
         self.trainer = PPOTrainer(config=ppo_config, device=device)
@@ -38,6 +53,18 @@ class SimulationOrchestrator:
         self.event_injector = EventInjector()
         self.response_generator = ResponseGenerator()
         self.ws_manager = ConnectionManager()
+
+        # Phase B modules
+        self.ecology = EcologyManager()
+        self.multilingual = MultilingualPipeline()
+        self.retention = RetentionManager()
+        self.user_id = user_id
+        self.session_id = session_id
+
+        # Procedural generation
+        self.world_seed = WorldSeed(user_id=user_id, session_id=session_id)
+        self.procedural_config = ProceduralConfig()
+        self.world_layout = None
 
         self.device = device
         self.running = False
@@ -50,10 +77,39 @@ class SimulationOrchestrator:
         self._training_enabled = True
 
     def reset(self) -> np.ndarray:
-        """Reset the environment and return initial observation."""
+        """Reset the environment, apply procedural gen, and spawn ecology."""
         frame = self.env.reset()
         self.step_count = 0
         self.episode_count += 1
+
+        # Generate procedural world layout
+        self.world_layout = generate_world(
+            self.world_seed,
+            config=self.procedural_config,
+            arena_size=self.env.config.arena_size,
+            difficulty=self.ecology.curriculum.difficulty,
+        )
+
+        # Spawn ecology resources at procedurally-placed positions
+        self.ecology = EcologyManager(seed=self.world_seed.seed)
+        resource_types = ["energy", "food", "points"]
+        for i, pos in enumerate(self.world_layout.resource_positions):
+            rtype = resource_types[i % len(resource_types)]
+            self.ecology.spawn_resource(
+                position=[pos[0], pos[1], 0.3],
+                resource_type=rtype,
+                value=1.0 + self.ecology.curriculum.difficulty,
+            )
+
+        # Spawn NPCs
+        behaviors = ["wander", "patrol", "follow", "flee"]
+        npc_positions = self.world_layout.object_positions[:3]
+        for i, pos in enumerate(npc_positions):
+            self.ecology.spawn_npc(
+                position=[pos[0], pos[1], 0.5],
+                behavior=behaviors[i % len(behaviors)],
+            )
+
         return frame
 
     def step(self, frame: np.ndarray) -> dict[str, Any]:
@@ -91,10 +147,35 @@ class SimulationOrchestrator:
             self.replay_buffer.add(latent_z, action, result.reward, next_z, result.done)
 
         self._check_event_interactions()
+
+        # Update ecology (day/night, weather, NPCs, resource collection)
+        dt = 1.0 / 60.0 * self.speed_multiplier
+        agent_pos = self.env.agent.position.tolist()
+        ecology_update = self.ecology.update(
+            dt=dt, agent_position=agent_pos, current_time=time.time(),
+        )
+
+        # Apply ecology reward modifiers
+        eco_modifier = self.ecology.get_reward_modifier()
+        for eco_event in ecology_update.get("events", []):
+            if eco_event["type"] == "resource_collected":
+                result = StepResult(
+                    observation=result.observation,
+                    reward=result.reward + eco_event["value"] * eco_modifier,
+                    done=result.done,
+                    info=result.info,
+                )
+
         self.step_count += 1
 
         attention_np = perception["attention_map"].cpu().numpy()
         features_np = perception["features_downsampled"].cpu().numpy().squeeze(0)
+
+        # Collect orb animation states for rendering
+        orb_animations = []
+        now = time.time()
+        for event in self.event_injector.get_active_events():
+            orb_animations.append(get_orb_animation_state(event, now))
 
         return {
             "frame": result.observation,
@@ -105,6 +186,8 @@ class SimulationOrchestrator:
             "done": result.done,
             "state": result.info,
             "step": self.step_count,
+            "ecology": ecology_update,
+            "orb_animations": orb_animations,
         }
 
     def train_step(self) -> dict[str, Any] | None:
@@ -124,8 +207,13 @@ class SimulationOrchestrator:
         return stats
 
     def inject_question(self, text: str, user_id: str = "anon") -> dict[str, Any]:
-        """Inject a question as a world event."""
-        event = self.event_injector.create_question_event(text)
+        """Inject a question as a world event with multilingual support."""
+        # Detect language and translate to English for processing
+        ml_input = self.multilingual.process_input(text)
+        english_text = ml_input["english_text"]
+        source_lang = ml_input["source_lang"]
+
+        event = self.event_injector.create_question_event(english_text)
 
         body_id = self.env.inject_entity(
             "query_orb",
@@ -144,15 +232,32 @@ class SimulationOrchestrator:
             self.memory.store(
                 embedding=self.current_latent,
                 event_type="question",
-                context=text,
+                context=english_text,
                 metadata={"user_id": user_id, "event_id": event.event_id},
             )
+
+        # Record interaction for retention
+        user_store = self.retention.get_store(user_id)
+        user_store.record_interaction(
+            event_type="question",
+            context=english_text,
+            embedding=self.current_latent,
+            metadata={
+                "event_id": event.event_id,
+                "original_text": text,
+                "source_lang": source_lang,
+            },
+        )
 
         return {
             "event_id": event.event_id,
             "body_id": body_id,
             "position": event.position,
             "status": "injected",
+            "source_lang": source_lang,
+            "original_text": text,
+            "english_text": english_text,
+            "was_translated": ml_input.get("was_translated", False),
         }
 
     def process_question_response(self, event_id: str) -> dict[str, Any] | None:
@@ -197,6 +302,9 @@ class SimulationOrchestrator:
     def get_full_state(self) -> dict[str, Any]:
         """Get complete simulation state for streaming."""
         env_state = self.env.get_state()
+        ecology_state = self.ecology.get_state()
+        user_store = self.retention.get_store(self.user_id)
+
         return {
             "environment": env_state,
             "training": {
@@ -216,6 +324,15 @@ class SimulationOrchestrator:
             "action": self.current_action_info,
             "speed": self.speed_multiplier,
             "paused": self.paused,
+            "ecology": ecology_state,
+            "procedural": {
+                "seed": self.world_seed.seed,
+                "difficulty": self.ecology.curriculum.difficulty,
+                "heightmap_resolution": (
+                    self.procedural_config.terrain.resolution
+                ),
+            },
+            "retention": user_store.get_state(),
         }
 
     async def run_loop(self, target_fps: int = 60,

@@ -6,6 +6,8 @@ interface ActionInfo {
   entropy?: number;
   action_mean?: number[];
   action_std?: number[];
+  discrete_action?: string;
+  discrete_probs?: number[];
 }
 
 interface TrainingInfo {
@@ -50,6 +52,30 @@ export function DecisionPanel({ action, training }: {
           />
         ))}
       </div>
+
+      {action?.discrete_action && (
+        <div style={{ marginBottom: '6px' }}>
+          <div style={{ fontSize: '9px', color: '#555', marginBottom: '2px' }}>DISCRETE ACTION</div>
+          <div style={{ display: 'flex', gap: '3px' }}>
+            {['none', 'interact', 'pick', 'drop'].map((a, i) => (
+              <span key={a} style={{
+                flex: 1, textAlign: 'center', fontSize: '9px', padding: '2px',
+                borderRadius: '3px',
+                background: action.discrete_action === a ? '#2a4a2a' : '#111',
+                color: action.discrete_action === a ? '#4caf50' : '#555',
+                border: action.discrete_action === a ? '1px solid #4caf50' : '1px solid #222',
+              }}>
+                {a.toUpperCase()}
+                {action.discrete_probs?.[i] !== undefined && (
+                  <div style={{ fontSize: '8px', color: '#444' }}>
+                    {(action.discrete_probs[i] * 100).toFixed(0)}%
+                  </div>
+                )}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
         <StatBox label="Confidence" value={`${((action?.confidence ?? 0) * 100).toFixed(0)}%`}

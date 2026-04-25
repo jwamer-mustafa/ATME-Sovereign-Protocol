@@ -6,6 +6,8 @@ import { ControlPanel } from './components/ControlPanel';
 import { MemoryTimeline } from './components/MemoryTimeline';
 import { AuthPanel } from './components/AuthPanel';
 import { BillingPanel } from './components/BillingPanel';
+import { EcologyPanel } from './components/EcologyPanel';
+import { RetentionPanel } from './components/RetentionPanel';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useAuth } from './hooks/useAuth';
 
@@ -83,6 +85,22 @@ export default function App() {
     sendMessage({ type: 'toggle_pause' });
   }, [sendMessage]);
 
+  const handleSelectAgent = useCallback(async (agentId: string) => {
+    if (!token) return;
+    try {
+      await fetch('/api/retention/select-agent', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ agent_id: agentId }),
+      });
+    } catch (e) {
+      console.error('Agent selection failed', e);
+    }
+  }, [token]);
+
   return (
     <div style={styles.container}>
       <div style={styles.header}>
@@ -124,6 +142,8 @@ export default function App() {
       <div style={styles.sidePanel}>
         <PerceptionPanel perception={perception} />
         <DecisionPanel action={state?.action} training={state?.training} />
+        <EcologyPanel ecology={state?.ecology} />
+        <RetentionPanel retention={state?.retention} onSelectAgent={handleSelectAgent} />
         <MemoryTimeline memory={state?.memory} events={state?.events} />
       </div>
 

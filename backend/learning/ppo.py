@@ -2,6 +2,8 @@
 PPO (Proximal Policy Optimization) implementation for the embodied agent.
 State: latent z from vision encoder
 Action: continuous [forward/backward, left/right, rotation]
+      + discrete [interact, pick, drop]
+Supports curiosity module (RND) for intrinsic motivation.
 """
 
 from __future__ import annotations
@@ -13,13 +15,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch.distributions import Normal
+from torch.distributions import Categorical, Normal
 
 
 @dataclass
 class PPOConfig:
     latent_dim: int = 256
-    action_dim: int = 3
+    action_dim: int = 3  # continuous actions
+    discrete_action_dim: int = 4  # none, interact, pick, drop
     hidden_dim: int = 256
     lr: float = 3e-4
     gamma: float = 0.99
@@ -32,14 +35,20 @@ class PPOConfig:
     batch_size: int = 64
     buffer_size: int = 2048
     novelty_bonus: float = 0.1
+    use_curiosity: bool = True
+    curiosity_scale: float = 0.1
+
+
+DISCRETE_ACTIONS = ["none", "interact", "pick", "drop"]
 
 
 class ActorCritic(nn.Module):
-    """Combined actor-critic network for PPO."""
+    """Combined actor-critic network for PPO with continuous + discrete actions."""
 
     def __init__(self, latent_dim: int = 256, action_dim: int = 3,
-                 hidden_dim: int = 256):
+                 hidden_dim: int = 256, discrete_action_dim: int = 4):
         super().__init__()
+        self.discrete_action_dim = discrete_action_dim
 
         self.shared = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
@@ -56,6 +65,12 @@ class ActorCritic(nn.Module):
         )
         self.actor_log_std = nn.Parameter(torch.zeros(action_dim))
 
+        self.discrete_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, discrete_action_dim),
+        )
+
         self.critic = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
@@ -70,6 +85,17 @@ class ActorCritic(nn.Module):
         value = self.critic(shared_features)
         return dist, value
 
+    def forward_full(self, z: Tensor) -> tuple[Normal, Categorical, Tensor]:
+        """Forward pass returning both continuous and discrete distributions."""
+        shared_features = self.shared(z)
+        action_mean = self.actor_mean(shared_features)
+        action_std = self.actor_log_std.exp().expand_as(action_mean)
+        cont_dist = Normal(action_mean, action_std)
+        discrete_logits = self.discrete_head(shared_features)
+        disc_dist = Categorical(logits=discrete_logits)
+        value = self.critic(shared_features)
+        return cont_dist, disc_dist, value
+
     def get_action(self, z: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Sample action, return (action, log_prob, value, entropy)."""
         dist, value = self(z)
@@ -78,6 +104,24 @@ class ActorCritic(nn.Module):
         log_prob = dist.log_prob(action).sum(dim=-1)
         entropy = dist.entropy().sum(dim=-1)
         return action, log_prob, value.squeeze(-1), entropy
+
+    def get_full_action(
+        self, z: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Sample both continuous and discrete actions."""
+        cont_dist, disc_dist, value = self.forward_full(z)
+        cont_action = torch.clamp(cont_dist.sample(), -1.0, 1.0)
+        cont_log_prob = cont_dist.log_prob(cont_action).sum(dim=-1)
+        cont_entropy = cont_dist.entropy().sum(dim=-1)
+        disc_action = disc_dist.sample()
+        disc_log_prob = disc_dist.log_prob(disc_action)
+        disc_entropy = disc_dist.entropy()
+        return (
+            cont_action, cont_log_prob,
+            disc_action, disc_log_prob,
+            value.squeeze(-1),
+            cont_entropy + disc_entropy,
+        )
 
     def evaluate_action(self, z: Tensor, action: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """Evaluate a previously taken action."""
@@ -170,6 +214,7 @@ class PPOTrainer:
             latent_dim=self.config.latent_dim,
             action_dim=self.config.action_dim,
             hidden_dim=self.config.hidden_dim,
+            discrete_action_dim=self.config.discrete_action_dim,
         ).to(self.device)
 
         self.optimizer = torch.optim.Adam(
@@ -182,30 +227,47 @@ class PPOTrainer:
             action_dim=self.config.action_dim,
         )
 
+        self.curiosity: "RNDModule | None" = None
+        if self.config.use_curiosity:
+            from backend.learning.curiosity import RNDConfig, RNDModule
+            rnd_config = RNDConfig(
+                input_dim=self.config.latent_dim,
+                reward_scale=self.config.curiosity_scale,
+            )
+            self.curiosity = RNDModule(config=rnd_config, device=device)
+
         self.training_stats: list[dict] = []
         self._state_embeddings: list[np.ndarray] = []
         self.total_steps = 0
 
     def select_action(self, latent_z: np.ndarray) -> dict:
-        """Select action given latent state."""
+        """Select both continuous and discrete actions given latent state."""
         z_tensor = torch.FloatTensor(latent_z).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
-            action, log_prob, value, entropy = self.policy.get_action(z_tensor)
-            dist, _ = self.policy(z_tensor)
+            (
+                cont_action, cont_log_prob,
+                disc_action, disc_log_prob,
+                value, entropy,
+            ) = self.policy.get_full_action(z_tensor)
+            cont_dist, disc_dist, _ = self.policy.forward_full(z_tensor)
 
-        action_np = action.cpu().numpy().squeeze(0)
-        confidence = 1.0 - entropy.item() / (self.config.action_dim * 2.0)
+        action_np = cont_action.cpu().numpy().squeeze(0)
+        disc_idx = disc_action.item()
+        confidence = 1.0 - entropy.item() / (self.config.action_dim * 2.0 + 2.0)
         confidence = max(0.0, min(1.0, confidence))
 
         return {
             "action": action_np.tolist(),
-            "log_prob": log_prob.item(),
+            "discrete_action": DISCRETE_ACTIONS[disc_idx],
+            "discrete_action_idx": disc_idx,
+            "discrete_probs": disc_dist.probs.cpu().numpy().squeeze(0).tolist(),
+            "log_prob": cont_log_prob.item() + disc_log_prob.item(),
             "value": value.item(),
             "entropy": entropy.item(),
             "confidence": confidence,
-            "action_mean": dist.loc.cpu().numpy().squeeze(0).tolist(),
-            "action_std": dist.scale.cpu().numpy().squeeze(0).tolist(),
+            "action_mean": cont_dist.loc.cpu().numpy().squeeze(0).tolist(),
+            "action_std": cont_dist.scale.cpu().numpy().squeeze(0).tolist(),
         }
 
     def store_transition(self, state: np.ndarray, action: np.ndarray,
@@ -213,6 +275,11 @@ class PPOTrainer:
                          done: bool) -> None:
         novelty = self._compute_novelty(state)
         reward += self.config.novelty_bonus * novelty
+
+        if self.curiosity is not None:
+            intrinsic_reward = self.curiosity.compute_intrinsic_reward(state)
+            reward += intrinsic_reward
+
         self.buffer.add(state, action, reward, value, log_prob, done)
         self._state_embeddings.append(state.copy())
         if len(self._state_embeddings) > 10000:
@@ -300,6 +367,12 @@ class PPOTrainer:
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.total_steps = checkpoint["total_steps"]
         self.training_stats = checkpoint["training_stats"]
+
+    def train_curiosity(self, states: np.ndarray) -> float | None:
+        """Train the RND curiosity module on a batch of states."""
+        if self.curiosity is None:
+            return None
+        return self.curiosity.train_step(states)
 
     def _compute_novelty(self, state: np.ndarray) -> float:
         """Novelty bonus based on distance from recent states."""
