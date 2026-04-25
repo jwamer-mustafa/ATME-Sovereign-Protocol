@@ -47,10 +47,14 @@ export function BillingPanel({ tier, token, onClose }: BillingPanelProps) {
   const handleUpgrade = async (tierId: string) => {
     if (!token) return;
     try {
-      await fetch(`/api/billing/upgrade?tier=${tierId}`, {
+      const res = await fetch(`/api/billing/upgrade?tier=${tierId}`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
       });
+      const data = await res.json();
+      if (data.access_token) {
+        localStorage.setItem('eai_token', data.access_token);
+      }
       window.location.reload();
     } catch (e) {
       console.error('Upgrade failed', e);
