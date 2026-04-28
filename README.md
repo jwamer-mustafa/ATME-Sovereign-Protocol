@@ -1,59 +1,130 @@
-# ATME — Adaptive Temporal Mining Engine
+# Embodied AI Platform
 
-ATME is an experimental research project exploring the temporal dimension of Proof-of-Work mining behavior.
+A real-time embodied AI platform featuring a 3D physics environment with an RL agent that learns, perceives, and interacts — streamed live to users via a web interface.
 
-The project investigates whether mining success probability is influenced solely by computational hash rate, or whether timing, latency, and physical entropy sources may influence share acceptance behavior in real mining networks.
+## Architecture
 
-This repository does NOT attempt to replace traditional mining hardware.  
-Instead, it attempts to measure and model mining as a **time-coupled probabilistic process**.
+```
+[Frontend React/Three.js]
+  ├─ Scene (WebGL 3D)
+  ├─ Perception Panels (Camera/Attention/Features/Decision)
+  ├─ Interaction (Inject Event / Ask)
+  └─ Billing UI
 
----
+        ⇅ WebSocket (60 FPS state, 10–20 FPS perception)
+        ⇅ REST (auth, billing, configs)
 
-## Core Hypothesis
+[Gateway - FastAPI]
+  ├─ Auth (JWT)
+  ├─ Billing (Stripe)
+  ├─ Session Manager
+  └─ Rate Limits / Tier Control
 
-Mining is typically modeled as:
+[Simulation Core - Python]
+  ├─ Physics Env (PyBullet)
+  ├─ Sensor Stack (RGB Camera)
+  ├─ Agent (Policy + Value Network)
+  ├─ Memory (Replay + Episodic)
+  └─ Event Injector (Questions → World Entities)
 
-> A purely computational brute-force hash search.
+[Learning Core]
+  ├─ RL Algorithm (PPO)
+  ├─ Vision Encoder (CNN)
+  ├─ Attention/Saliency Export (Grad-CAM)
+  └─ Checkpointing
 
-ATME explores an alternative interpretation:
+[Streaming]
+  ├─ Frame Encoder (JPEG/base64)
+  ├─ State/Telemetry (WebSocket)
+  └─ Perception Payload (compressed)
+```
 
-> Mining may be understood as a stochastic event synchronization problem between the miner and the network.
+## Features
 
-The system introduces a new experimental framework:
+- **3D Physics Environment**: Continuous space with gravity, collisions, objects, and targets (PyBullet)
+- **Embodied Agent**: Capsule agent with forward-facing camera, learns via PPO
+- **Full Perception Pipeline**: Camera → CNN Encoder → Latent → Attention/Saliency → UI
+- **Episodic Memory**: Embedding-based memory with cosine similarity retrieval
+- **Event Injection**: Questions become physical world entities (query orbs)
+- **Real-time Streaming**: WebSocket state (60 FPS) + perception (10-20 FPS)
+- **Ethical Safeguards**: No consciousness claims, mandatory confidence display
+- **SaaS Ready**: JWT auth, Stripe billing, tier-based access (Free/Pro/Creator)
 
-**Proof of Reality (PoR)**
+## Quick Start
 
-Where mining attempts are triggered by entropy-driven physical events rather than continuous hashing.
+### Prerequisites
 
----
+- Python 3.10+
+- Node.js 18+
+- Docker & Docker Compose (for production)
 
-## What This Project Contains
+### Development Setup
 
-• A mobile entropy acquisition node  
-• A temporal mining trigger system  
-• Stratum protocol monitoring  
-• Share acceptance statistical analysis  
-• Experimental validation framework
+```bash
+# Backend
+pip install -e ".[dev]"
+uvicorn backend.gateway.app:app --reload --port 8000
 
----
+# Frontend
+cd frontend
+npm install
+npm run dev
+```
 
-## Repository Structure
-docs/       → research and theoretical framework
-core/       → mining and signal processing engine
-mobile/     → Android sensor acquisition client
-assets/logs → experimental output data
----
+### Docker Deployment
 
-## Research Objective
+```bash
+docker compose up --build
+```
 
-To measure whether phase-aligned mining attempts exhibit statistically significant deviation from uniform hash attempt distribution.
+### Running Tests
 
-If validated, mining could be partially modeled as:
+```bash
+pytest tests/ -v
+```
 
-> A latency-sensitive synchronization system rather than a pure hash-power competition.
+## Subscription Tiers
 
----
+| Feature | Free | Pro ($9.99/mo) | Creator ($29.99/mo) |
+|---------|------|-----------------|---------------------|
+| Stream | 5s delay | Live | Live |
+| Events/day | 0 | 5 | Unlimited |
+| Speed Control | No | Yes | Yes |
+| Env Control | No | No | Yes |
 
-## Status
+## Ethical Guidelines
 
-Early research prototype — experimental validation pending.
+- No anthropomorphic claims ("I feel", "I want", etc.)
+- Mandatory confidence display on all responses
+- Transparent uncertainty reporting
+- All responses include a computational disclaimer
+
+## API Endpoints
+
+### Auth
+- `POST /api/auth/register` — Register new user
+- `POST /api/auth/login` — Login
+- `GET /api/auth/me` — Get current user info
+
+### Billing
+- `GET /api/billing/tiers` — List available tiers
+- `POST /api/billing/upgrade` — Upgrade subscription
+
+### Simulation
+- `GET /api/simulation/state` — Get full simulation state
+- `POST /api/simulation/event` — Inject question event
+- `POST /api/simulation/speed` — Set simulation speed
+- `POST /api/simulation/pause` — Toggle pause
+- `GET /api/simulation/training` — Get training stats
+- `GET /api/simulation/memory` — Get memory state
+- `GET /api/simulation/events` — List active/resolved events
+
+### WebSocket
+- `ws://host/ws/{client_id}` — Real-time state + perception stream
+
+## KPIs
+
+- Latency < 120ms
+- Session time > 6 minutes
+- Day-1 Retention > 20%
+- Conversion > 3%

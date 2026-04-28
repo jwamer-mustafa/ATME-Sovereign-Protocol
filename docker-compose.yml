@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    ports:
+      - "8000:8000"
+    environment:
+      - EAI_DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/embodied_ai
+      - EAI_REDIS_URL=redis://redis:6379
+      - EAI_JWT_SECRET=${JWT_SECRET:-production-secret-change-me}
+      - EAI_STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    command: ["python", "-m", "backend.learning.ppo"]
+    environment:
+      - EAI_DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/embodied_ai
+      - EAI_REDIS_URL=redis://redis:6379
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: embodied_ai
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
