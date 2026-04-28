@@ -124,11 +124,22 @@ class ActorCritic(nn.Module):
         )
 
     def evaluate_action(self, z: Tensor, action: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        """Evaluate a previously taken action."""
+        """Evaluate a previously taken continuous action (legacy, continuous only)."""
         dist, value = self(z)
         log_prob = dist.log_prob(action).sum(dim=-1)
         entropy = dist.entropy().sum(dim=-1)
         return log_prob, value.squeeze(-1), entropy
+
+    def evaluate_full_action(
+        self, z: Tensor, cont_action: Tensor, disc_action: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Evaluate both continuous and discrete actions for PPO update."""
+        cont_dist, disc_dist, value = self.forward_full(z)
+        cont_log_prob = cont_dist.log_prob(cont_action).sum(dim=-1)
+        disc_log_prob = disc_dist.log_prob(disc_action)
+        total_log_prob = cont_log_prob + disc_log_prob
+        total_entropy = cont_dist.entropy().sum(dim=-1) + disc_dist.entropy()
+        return total_log_prob, value.squeeze(-1), total_entropy
 
 
 class RolloutBuffer:
@@ -143,6 +154,7 @@ class RolloutBuffer:
     def reset(self) -> None:
         self.states = np.zeros((self.buffer_size, self.latent_dim), dtype=np.float32)
         self.actions = np.zeros((self.buffer_size, self.action_dim), dtype=np.float32)
+        self.discrete_actions = np.zeros(self.buffer_size, dtype=np.int64)
         self.rewards = np.zeros(self.buffer_size, dtype=np.float32)
         self.values = np.zeros(self.buffer_size, dtype=np.float32)
         self.log_probs = np.zeros(self.buffer_size, dtype=np.float32)
@@ -152,11 +164,13 @@ class RolloutBuffer:
         self.ptr = 0
 
     def add(self, state: np.ndarray, action: np.ndarray, reward: float,
-            value: float, log_prob: float, done: bool) -> None:
+            value: float, log_prob: float, done: bool,
+            discrete_action: int = 0) -> None:
         if self.ptr >= self.buffer_size:
             return
         self.states[self.ptr] = state
         self.actions[self.ptr] = action
+        self.discrete_actions[self.ptr] = discrete_action
         self.rewards[self.ptr] = reward
         self.values[self.ptr] = value
         self.log_probs[self.ptr] = log_prob
@@ -197,6 +211,7 @@ class RolloutBuffer:
             yield {
                 "states": torch.FloatTensor(self.states[batch_idx]),
                 "actions": torch.FloatTensor(self.actions[batch_idx]),
+                "discrete_actions": torch.LongTensor(self.discrete_actions[batch_idx]),
                 "old_log_probs": torch.FloatTensor(self.log_probs[batch_idx]),
                 "advantages": torch.FloatTensor(self.advantages[batch_idx]),
                 "returns": torch.FloatTensor(self.returns[batch_idx]),
@@ -272,7 +287,7 @@ class PPOTrainer:
 
     def store_transition(self, state: np.ndarray, action: np.ndarray,
                          reward: float, value: float, log_prob: float,
-                         done: bool) -> None:
+                         done: bool, discrete_action: int = 0) -> None:
         novelty = self._compute_novelty(state)
         reward += self.config.novelty_bonus * novelty
 
@@ -280,7 +295,8 @@ class PPOTrainer:
             intrinsic_reward = self.curiosity.compute_intrinsic_reward(state)
             reward += intrinsic_reward
 
-        self.buffer.add(state, action, reward, value, log_prob, done)
+        self.buffer.add(state, action, reward, value, log_prob, done,
+                        discrete_action=discrete_action)
         self._state_embeddings.append(state.copy())
         if len(self._state_embeddings) > 10000:
             self._state_embeddings = self._state_embeddings[-5000:]
@@ -299,14 +315,15 @@ class PPOTrainer:
             for batch in self.buffer.get_batches(self.config.batch_size):
                 states = batch["states"].to(self.device)
                 actions = batch["actions"].to(self.device)
+                discrete_actions = batch["discrete_actions"].to(self.device)
                 old_log_probs = batch["old_log_probs"].to(self.device)
                 advantages = batch["advantages"].to(self.device)
                 returns = batch["returns"].to(self.device)
 
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-                new_log_probs, values, entropy = self.policy.evaluate_action(
-                    states, actions
+                new_log_probs, values, entropy = self.policy.evaluate_full_action(
+                    states, actions, discrete_actions
                 )
 
                 ratio = (new_log_probs - old_log_probs).exp()

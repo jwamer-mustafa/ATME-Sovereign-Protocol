@@ -6,6 +6,7 @@ day/night cycles, and adaptive difficulty.
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -337,6 +338,7 @@ class EcologyManager:
             dist = math.sqrt(dx * dx + dy * dy)
             if dist < 0.8:
                 resource.collected = True
+                resource.collected_at = time.time()
                 collected.append(resource)
         return collected
 
