@@ -136,6 +136,7 @@ class SimulationOrchestrator:
                 value=action_info["value"],
                 log_prob=action_info["log_prob"],
                 done=result.done,
+                discrete_action=action_info.get("discrete_action_idx", 0),
             )
 
             next_frame_tensor = (
